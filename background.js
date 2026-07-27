@@ -186,11 +186,17 @@ function updateBadge(tabId) {
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
     if (!details.requestHeaders) return;
-    const isManifest =
+    // Match anything that could be a media manifest/segment, including the
+    // extensionless manifest URLs (Vimeo, some CDNs) caught via the HINT
+    // patterns and HLS .ts segments we derive manifests from.
+    const isMedia =
       HLS_EXT.test(details.url) ||
       DASH_EXT.test(details.url) ||
-      DIRECT_EXT.test(details.url);
-    if (!isManifest) return;
+      DIRECT_EXT.test(details.url) ||
+      HLS_HINT.test(details.url) ||
+      DASH_HINT.test(details.url) ||
+      HLS_SEG.test(details.url);
+    if (!isMedia) return;
     const h = {};
     for (const header of details.requestHeaders) {
       const name = header.name.toLowerCase();
@@ -199,7 +205,10 @@ chrome.webRequest.onSendHeaders.addListener(
     if (Object.keys(h).length) headersByUrl.set(details.url, h);
   },
   { urls: ["<all_urls>"] },
-  ["requestHeaders"]
+  // "extraHeaders" is REQUIRED for Chrome to include Cookie/Origin/User-Agent
+  // in the event. Without it these are stripped and the replayed ffmpeg
+  // request is rejected by the CDN with 403 Forbidden.
+  ["requestHeaders", "extraHeaders"]
 );
 
 // --- Network sniffing -------------------------------------------------------
