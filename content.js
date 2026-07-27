@@ -70,9 +70,41 @@
     } catch (e) {}
   }
 
+  // --- Patreon post detection --------------------------------------------
+  // On a Patreon post page that contains video, report the numeric post id so
+  // the popup can build a `yt-dlp` command. Patreon's Mux streams use a signed
+  // token + referrer restriction that can't be replayed as a raw .m3u8, so
+  // yt-dlp (given the post URL + your cookies) is the reliable path.
+  let reportedPatreon = false;
+
+  function scanPatreon() {
+    if (reportedPatreon) return;
+    if (!/(^|\.)patreon\.com$/i.test(location.hostname)) return;
+    // Post id is the trailing number of the /posts/<slug>-<id> path segment.
+    const m = location.pathname.match(/\/posts\/(?:[^/?#]*-)?(\d{3,})(?:[/?#]|$)/);
+    if (!m) return;
+    // Only surface for posts that actually carry video (skip text posts).
+    let hasMedia = !!document.querySelector("video");
+    if (!hasMedia) {
+      try {
+        hasMedia = /mux\.com|\.m3u8|<video/i.test(document.documentElement.innerHTML);
+      } catch (e) {}
+    }
+    if (!hasMedia) return;
+    reportedPatreon = true;
+    try {
+      chrome.runtime.sendMessage({
+        type: "patreonFound",
+        id: m[1],
+        pageUrl: location.href
+      });
+    } catch (e) {}
+  }
+
   function scan() {
     document.querySelectorAll("video").forEach(hook);
     scanVimeo();
+    scanPatreon();
   }
 
   scan();

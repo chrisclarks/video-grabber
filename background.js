@@ -6,6 +6,8 @@
 const mediaByTab = new Map();
 // tabId -> Map<vimeoId, {id, pageUrl, grabvid, ytdlp}>
 const vimeoByTab = new Map();
+// tabId -> Map<patreonPostId, {id, pageUrl, canonical, ytdlp}>
+const patreonByTab = new Map();
 // Most recent request headers we saw, keyed by url. Used to replay
 // Referer/User-Agent/Cookie so ffmpeg isn't rejected (403) by the CDN.
 const headersByUrl = new Map();
@@ -151,6 +153,40 @@ function addVimeo(tabId, id, pageUrl) {
   updateBadge(tabId);
 }
 
+// Build a yt-dlp command for a Patreon post. Patreon serves video through Mux
+// with a short-lived signed token + referrer restriction, so the raw .m3u8
+// can't be replayed reliably (403/400). yt-dlp's Patreon extractor instead
+// takes the POST URL, reads your logged-in cookies, and fetches a correctly
+// signed stream itself — then merges audio+video into one MP4 via ffmpeg.
+//
+// IMPORTANT: yt-dlp's extractor only matches the canonical
+// `patreon.com/posts/<id>` form. A creator-prefixed URL like
+// `patreon.com/<creator>/posts/<slug>-<id>` falls back to the generic
+// extractor and fails ("Unsupported URL"), so we always rebuild the canonical
+// URL from the numeric post id.
+function buildPatreon(id, pageUrl) {
+  const canonical = "https://www.patreon.com/posts/" + id;
+  // --cookies-from-browser chrome proves your membership entitlement and
+  // avoids the expired-token problem entirely (it re-reads fresh cookies).
+  const ytdlp = "yt-dlp --cookies-from-browser chrome " + shQuote(canonical);
+  // Variant that drops the file into ~/Downloads with a clean title.
+  const ytdlpNamed =
+    "yt-dlp --cookies-from-browser chrome -o " +
+    shQuote("~/Downloads/%(title)s.%(ext)s") +
+    " " +
+    shQuote(canonical);
+  return { id, pageUrl, canonical, ytdlp, ytdlpNamed };
+}
+
+function addPatreon(tabId, id, pageUrl) {
+  if (tabId < 0 || !id) return;
+  if (!patreonByTab.has(tabId)) patreonByTab.set(tabId, new Map());
+  const map = patreonByTab.get(tabId);
+  if (map.has(id)) return;
+  map.set(id, buildPatreon(id, pageUrl));
+  updateBadge(tabId);
+}
+
 function addMedia(tabId, url, type, source) {
   if (tabId < 0 || !url || url.startsWith("blob:") || url.startsWith("data:")) return;
   const map = getTabMap(tabId);
@@ -173,7 +209,11 @@ function addMedia(tabId, url, type, source) {
 function updateBadge(tabId) {
   const media = mediaByTab.get(tabId);
   const vimeo = vimeoByTab.get(tabId);
-  const count = (media ? media.size : 0) + (vimeo ? vimeo.size : 0);
+  const patreon = patreonByTab.get(tabId);
+  const count =
+    (media ? media.size : 0) +
+    (vimeo ? vimeo.size : 0) +
+    (patreon ? patreon.size : 0);
   chrome.action.setBadgeBackgroundColor({ color: "#d6336c" });
   chrome.action.setBadgeText({
     tabId,
@@ -271,11 +311,13 @@ chrome.webRequest.onResponseStarted.addListener(
 chrome.tabs.onRemoved.addListener((tabId) => {
   mediaByTab.delete(tabId);
   vimeoByTab.delete(tabId);
+  patreonByTab.delete(tabId);
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading" && changeInfo.url) {
     mediaByTab.delete(tabId);
     vimeoByTab.delete(tabId);
+    patreonByTab.delete(tabId);
     updateBadge(tabId);
   }
 });
@@ -298,6 +340,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 
+  if (msg.type === "patreonFound") {
+    const tabId = sender.tab ? sender.tab.id : -1;
+    addPatreon(tabId, msg.id, msg.pageUrl || (sender.tab && sender.tab.url) || "");
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (msg.type === "getMedia") {
     const map = mediaByTab.get(msg.tabId);
     const list = map ? Array.from(map.values()) : [];
@@ -311,7 +360,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     list.sort((a, b) => a.seenAt - b.seenAt);
     const vmap = vimeoByTab.get(msg.tabId);
     const vimeo = vmap ? Array.from(vmap.values()) : [];
-    sendResponse({ media: list, vimeo });
+    const pmap = patreonByTab.get(msg.tabId);
+    const patreon = pmap ? Array.from(pmap.values()) : [];
+    sendResponse({ media: list, vimeo, patreon });
     return false;
   }
 
@@ -326,6 +377,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "clear") {
     mediaByTab.delete(msg.tabId);
     vimeoByTab.delete(msg.tabId);
+    patreonByTab.delete(msg.tabId);
     updateBadge(msg.tabId);
     sendResponse({ ok: true });
     return false;
