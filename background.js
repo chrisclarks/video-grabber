@@ -2,22 +2,95 @@
 // Tracks media URLs per tab (network + content script), captures request
 // headers for streams, handles downloads, and builds ffmpeg commands.
 
-// tabId -> Map<url, mediaInfo>
-const mediaByTab = new Map();
-// tabId -> Map<vimeoId, {id, pageUrl, grabvid, ytdlp}>
-const vimeoByTab = new Map();
-// tabId -> Map<patreonPostId, {id, pageUrl, canonical, ytdlp}>
-const patreonByTab = new Map();
-// Most recent request headers we saw, keyed by url. Used to replay
-// Referer/User-Agent/Cookie so ffmpeg isn't rejected (403) by the CDN.
-const headersByUrl = new Map();
+// Per-tab state: tabId -> {media, vimeo, patreon, headers}, each a plain object
+//   media:   url -> {url, type, source, filename, seenAt}
+//   vimeo:   vimeoId -> {id, pageUrl, grabvid, ytdlp, merge}
+//   patreon: postId -> {id, pageUrl, canonical, ytdlp, ytdlpNamed}
+//   headers: manifestUrl -> {referer, user-agent, origin, cookie}, replayed to
+//            ffmpeg so the CDN doesn't reject it (403).
+//
+// MV3 shuts this service worker down after ~30s idle, which wipes anything held
+// only in memory — the badge would still say "2" while the popup showed nothing.
+// So the state is mirrored into chrome.storage.session (cleared when the browser
+// closes, not readable by content scripts) and reloaded when the worker wakes.
+const tabs = new Map();
+
+// Caps keep a long-running page from growing the state without bound.
+const MAX_MEDIA_PER_TAB = 100;
+const MAX_HEADERS_PER_TAB = 50;
+
+// Referer used for Vimeo commands when the page URL can't be parsed. Matches
+// the default baked into the grabvid helper (see grabvid-setup.md).
+const DEFAULT_REFERER = "https://www.warc.com/";
+
+const ready = chrome.storage.session
+  .get(null)
+  .then((all) => {
+    for (const [key, value] of Object.entries(all)) {
+      if (key.startsWith("tab:")) tabs.set(Number(key.slice(4)), value);
+    }
+  })
+  .catch(() => {});
+
+// Every read/write of tab state goes through here so nothing touches it
+// before the stored copy has been loaded.
+function withState(fn) {
+  return ready.then(fn);
+}
+
+function emptyTab() {
+  return { media: {}, vimeo: {}, patreon: {}, headers: {} };
+}
+
+function getTab(tabId) {
+  let s = tabs.get(tabId);
+  if (!s) {
+    s = emptyTab();
+    tabs.set(tabId, s);
+  }
+  return s;
+}
+
+function dropTab(tabId) {
+  tabs.delete(tabId);
+  persist(tabId);
+}
+
+// Writes are batched: many requests land in bursts (segments, frames).
+const dirtyTabs = new Set();
+let flushTimer = null;
+
+function persist(tabId) {
+  dirtyTabs.add(tabId);
+  if (!flushTimer) flushTimer = setTimeout(flush, 250);
+}
+
+function flush() {
+  flushTimer = null;
+  const toSet = {};
+  const toRemove = [];
+  for (const tabId of dirtyTabs) {
+    const s = tabs.get(tabId);
+    if (s) toSet["tab:" + tabId] = s;
+    else toRemove.push("tab:" + tabId);
+  }
+  dirtyTabs.clear();
+  // If storage is full the in-memory copy still works until the worker sleeps.
+  if (Object.keys(toSet).length) chrome.storage.session.set(toSet).catch(() => {});
+  if (toRemove.length) chrome.storage.session.remove(toRemove).catch(() => {});
+}
+
+// Drop the oldest keys (insertion order) so obj holds at most max entries.
+function capKeys(obj, max) {
+  const keys = Object.keys(obj);
+  for (let i = 0; i < keys.length - max; i++) delete obj[keys[i]];
+}
 
 const DIRECT_EXT = /\.(mp4|webm|ogg|ogv|m4v|mov|mkv|avi|flv|mp3|m4a|aac|wav)(\?|#|$)/i;
 const HLS_EXT = /\.m3u8(\?|#|$)/i;
 const DASH_EXT = /\.mpd(\?|#|$)/i;
 // HLS/DASH media segments. If we see these we can derive the manifest.
 const HLS_SEG = /\.ts(\?|#|$)/i;
-const FMP4_SEG = /\.(m4s|m4v|mp4)(\?|#|$)/i;
 // Manifest URLs that carry no obvious extension (Vimeo, some CDNs).
 const HLS_HINT = /(master|playlist|index|chunklist|manifest)\.(m3u8|json)|\/hls\/|format=m3u8|\.m3u8/i;
 const DASH_HINT = /\/dash\/|\.mpd|format=mpd|manifest\.mpd/i;
@@ -74,19 +147,29 @@ function filenameFromUrl(url) {
   }
 }
 
-function getTabMap(tabId) {
-  if (!mediaByTab.has(tabId)) mediaByTab.set(tabId, new Map());
-  return mediaByTab.get(tabId);
-}
-
 // Shell-quote a single argument for a POSIX shell (single quotes).
 function shQuote(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
 
+// Quote an argument containing CR/LF as bash/zsh $'...' so the command stays
+// one pasteable line. Raw CR/LF inside '...' get mangled on paste (CR turns
+// into a newline), which puts a blank line inside ffmpeg's header block.
+function ansiQuote(s) {
+  return (
+    "$'" +
+    String(s)
+      .replace(/\\/g, "\\\\")
+      .replace(/'/g, "\\'")
+      .replace(/\r/g, "\\r")
+      .replace(/\n/g, "\\n") +
+    "'"
+  );
+}
+
 // Build a remux-to-MP4 ffmpeg command for an HLS/DASH manifest.
-function buildFfmpeg(url, filename) {
-  const h = headersByUrl.get(url) || {};
+function buildFfmpeg(headers, url, filename) {
+  const h = headers[url] || {};
   const headerLines = [];
   if (h.referer) headerLines.push("Referer: " + h.referer);
   if (h.origin) headerLines.push("Origin: " + h.origin);
@@ -98,7 +181,7 @@ function buildFfmpeg(url, filename) {
   }
   if (headerLines.length) {
     // ffmpeg wants headers as one string with CRLF separators.
-    parts.push("-headers", shQuote(headerLines.join("\r\n") + "\r\n"));
+    parts.push("-headers", ansiQuote(headerLines.join("\r\n") + "\r\n"));
   }
   parts.push("-i", shQuote(url));
   parts.push("-c", "copy", "-bsf:a", "aac_adtstoasc");
@@ -112,7 +195,7 @@ function originOf(pageUrl) {
   try {
     return new URL(pageUrl).origin + "/";
   } catch {
-    return "https://www.warc.com/";
+    return DEFAULT_REFERER;
   }
 }
 
@@ -146,11 +229,13 @@ function buildVimeo(id, pageUrl) {
 
 function addVimeo(tabId, id, pageUrl) {
   if (tabId < 0 || !id) return;
-  if (!vimeoByTab.has(tabId)) vimeoByTab.set(tabId, new Map());
-  const map = vimeoByTab.get(tabId);
-  if (map.has(id)) return;
-  map.set(id, buildVimeo(id, pageUrl));
-  updateBadge(tabId);
+  withState(() => {
+    const s = getTab(tabId);
+    if (s.vimeo[id]) return;
+    s.vimeo[id] = buildVimeo(id, pageUrl);
+    persist(tabId);
+    updateBadge(tabId);
+  });
 }
 
 // Build a yt-dlp command for a Patreon post. Patreon serves video through Mux
@@ -180,69 +265,84 @@ function buildPatreon(id, pageUrl) {
 
 function addPatreon(tabId, id, pageUrl) {
   if (tabId < 0 || !id) return;
-  if (!patreonByTab.has(tabId)) patreonByTab.set(tabId, new Map());
-  const map = patreonByTab.get(tabId);
-  if (map.has(id)) return;
-  map.set(id, buildPatreon(id, pageUrl));
-  updateBadge(tabId);
+  withState(() => {
+    const s = getTab(tabId);
+    if (s.patreon[id]) return;
+    // A page shows one post, so a new post id replaces the previous one
+    // (Patreon moves between posts without a full page load).
+    s.patreon = { [id]: buildPatreon(id, pageUrl) };
+    persist(tabId);
+    updateBadge(tabId);
+  });
 }
 
 function addMedia(tabId, url, type, source) {
   if (tabId < 0 || !url || url.startsWith("blob:") || url.startsWith("data:")) return;
-  const map = getTabMap(tabId);
-  if (map.has(url)) return;
-  const filename = filenameFromUrl(url);
-  const info = {
-    url,
-    type,
-    source,
-    filename,
-    seenAt: Date.now()
-  };
-  if (type === "hls" || type === "dash") {
-    info.ffmpeg = buildFfmpeg(url, filename);
-  }
-  map.set(url, info);
-  updateBadge(tabId);
+  withState(() => {
+    const s = getTab(tabId);
+    if (s.media[url]) return;
+    s.media[url] = {
+      url,
+      type,
+      source,
+      filename: filenameFromUrl(url),
+      seenAt: Date.now()
+    };
+    capKeys(s.media, MAX_MEDIA_PER_TAB);
+    persist(tabId);
+    updateBadge(tabId);
+  });
+}
+
+function storeHeaders(tabId, url, h) {
+  withState(() => {
+    const s = getTab(tabId);
+    const prev = s.headers[url];
+    // Segments repeat identical headers; skip the redundant write.
+    if (prev && JSON.stringify(prev) === JSON.stringify(h)) return;
+    // Re-insert so the most recently used manifests survive the cap.
+    delete s.headers[url];
+    s.headers[url] = h;
+    capKeys(s.headers, MAX_HEADERS_PER_TAB);
+    persist(tabId);
+  });
 }
 
 function updateBadge(tabId) {
-  const media = mediaByTab.get(tabId);
-  const vimeo = vimeoByTab.get(tabId);
-  const patreon = patreonByTab.get(tabId);
-  const count =
-    (media ? media.size : 0) +
-    (vimeo ? vimeo.size : 0) +
-    (patreon ? patreon.size : 0);
+  const s = tabs.get(tabId);
+  const count = s
+    ? Object.keys(s.media).length +
+      Object.keys(s.vimeo).length +
+      Object.keys(s.patreon).length
+    : 0;
   chrome.action.setBadgeBackgroundColor({ color: "#d6336c" });
-  chrome.action.setBadgeText({
-    tabId,
-    text: count > 0 ? String(count) : ""
-  });
+  chrome.action
+    .setBadgeText({ tabId, text: count > 0 ? String(count) : "" })
+    .catch(() => {}); // tab may already be gone
 }
 
 // --- Capture request headers (for replaying to ffmpeg) ----------------------
 
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
-    if (!details.requestHeaders) return;
-    // Match anything that could be a media manifest/segment, including the
-    // extensionless manifest URLs (Vimeo, some CDNs) caught via the HINT
-    // patterns and HLS .ts segments we derive manifests from.
-    const isMedia =
-      HLS_EXT.test(details.url) ||
-      DASH_EXT.test(details.url) ||
-      DIRECT_EXT.test(details.url) ||
-      HLS_HINT.test(details.url) ||
-      DASH_HINT.test(details.url) ||
-      HLS_SEG.test(details.url);
-    if (!isMedia) return;
+    if (details.tabId < 0 || !details.requestHeaders) return;
+    const url = details.url;
+    // Only manifests need headers: ffmpeg is only built for HLS/DASH. For an
+    // HLS .ts segment, file its headers under the manifest we derive from it
+    // (one entry per stream, not one per segment).
+    let key = null;
+    if (HLS_EXT.test(url) || HLS_HINT.test(url) || DASH_EXT.test(url) || DASH_HINT.test(url)) {
+      key = url;
+    } else if (HLS_SEG.test(url)) {
+      key = manifestFromSegment(url);
+    }
+    if (!key) return;
     const h = {};
     for (const header of details.requestHeaders) {
       const name = header.name.toLowerCase();
       if (WANTED_HEADERS.includes(name)) h[name] = header.value;
     }
-    if (Object.keys(h).length) headersByUrl.set(details.url, h);
+    if (Object.keys(h).length) storeHeaders(details.tabId, key, h);
   },
   { urls: ["<all_urls>"] },
   // "extraHeaders" is REQUIRED for Chrome to include Cookie/Origin/User-Agent
@@ -276,12 +376,7 @@ chrome.webRequest.onBeforeRequest.addListener(
     // Saw an HLS .ts segment but never the manifest? Derive a best-guess manifest.
     if (HLS_SEG.test(url)) {
       const manifest = manifestFromSegment(url);
-      if (manifest) {
-        // store header context under the manifest url too
-        const h = headersByUrl.get(url);
-        if (h) headersByUrl.set(manifest, h);
-        addMedia(details.tabId, manifest, "hls", "segment-derived");
-      }
+      if (manifest) addMedia(details.tabId, manifest, "hls", "segment-derived");
     }
   },
   { urls: ["<all_urls>"] }
@@ -309,18 +404,23 @@ chrome.webRequest.onResponseStarted.addListener(
 );
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  mediaByTab.delete(tabId);
-  vimeoByTab.delete(tabId);
-  patreonByTab.delete(tabId);
+  withState(() => dropTab(tabId));
 });
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "loading" && changeInfo.url) {
-    mediaByTab.delete(tabId);
-    vimeoByTab.delete(tabId);
-    patreonByTab.delete(tabId);
-    updateBadge(tabId);
-  }
-});
+// A new page in the tab: full load, reload, or an in-page route change
+// (pushState, as Patreon and YouTube do between videos) — start a fresh list.
+// A #fragment change is deliberately not included: the same video is still
+// playing and its manifest won't be requested again, so clearing would lose
+// it. (tabs.onUpdated can't tell these apart — it reports all as "loading".)
+function onNewPage(details) {
+  if (details.frameId !== 0) return;
+  withState(() => {
+    if (!tabs.has(details.tabId)) return;
+    dropTab(details.tabId);
+    updateBadge(details.tabId);
+  });
+}
+chrome.webNavigation.onCommitted.addListener(onNewPage);
+chrome.webNavigation.onHistoryStateUpdated.addListener(onNewPage);
 
 // --- Messaging --------------------------------------------------------------
 
@@ -348,22 +448,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "getMedia") {
-    const map = mediaByTab.get(msg.tabId);
-    const list = map ? Array.from(map.values()) : [];
-    // Rebuild ffmpeg commands now so they include any headers captured after
-    // the manifest was first detected.
-    for (const m of list) {
-      if (m.type === "hls" || m.type === "dash") {
-        m.ffmpeg = buildFfmpeg(m.url, m.filename);
-      }
-    }
-    list.sort((a, b) => a.seenAt - b.seenAt);
-    const vmap = vimeoByTab.get(msg.tabId);
-    const vimeo = vmap ? Array.from(vmap.values()) : [];
-    const pmap = patreonByTab.get(msg.tabId);
-    const patreon = pmap ? Array.from(pmap.values()) : [];
-    sendResponse({ media: list, vimeo, patreon });
-    return false;
+    withState(() => {
+      const s = tabs.get(msg.tabId) || emptyTab();
+      // Build ffmpeg commands now so they include any headers captured after
+      // the manifest was first detected.
+      const list = Object.values(s.media).map((m) =>
+        m.type === "hls" || m.type === "dash"
+          ? { ...m, ffmpeg: buildFfmpeg(s.headers, m.url, m.filename) }
+          : m
+      );
+      list.sort((a, b) => a.seenAt - b.seenAt);
+      sendResponse({
+        media: list,
+        vimeo: Object.values(s.vimeo),
+        patreon: Object.values(s.patreon)
+      });
+    });
+    return true;
   }
 
   if (msg.type === "download") {
@@ -375,12 +476,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "clear") {
-    mediaByTab.delete(msg.tabId);
-    vimeoByTab.delete(msg.tabId);
-    patreonByTab.delete(msg.tabId);
-    updateBadge(msg.tabId);
-    sendResponse({ ok: true });
-    return false;
+    withState(() => {
+      dropTab(msg.tabId);
+      updateBadge(msg.tabId);
+      sendResponse({ ok: true });
+    });
+    return true;
   }
 
   return false;

@@ -124,6 +124,14 @@ function renderPatreon(patreon) {
   });
 }
 
+function isMux(url) {
+  try {
+    return /(^|\.)mux\.com$/i.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
 function getActiveTab() {
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -148,6 +156,7 @@ function render(media, vimeo, patreon) {
   }
   emptyEl.style.display = "none";
   countEl.textContent = total + " found";
+  const hasPatreon = !!(patreon && patreon.length);
 
   (media || []).forEach((m) => {
     const item = document.createElement("div");
@@ -191,7 +200,15 @@ function render(media, vimeo, patreon) {
 
     item.appendChild(row);
 
-    if (m.type !== "direct") {
+    if (m.type !== "direct" && hasPatreon && isMux(m.url)) {
+      // Patreon's Mux streams are signed + referrer-restricted; replaying them
+      // in ffmpeg fails with 403/400, so point at the yt-dlp command instead.
+      const hint = document.createElement("div");
+      hint.className = "hint";
+      hint.textContent =
+        "Patreon's signed Mux stream: ffmpeg gets rejected (403/400). Use the Patreon yt-dlp command above instead.";
+      item.appendChild(hint);
+    } else if (m.type !== "direct") {
       const hint = document.createElement("div");
       hint.className = "hint";
       hint.textContent =
