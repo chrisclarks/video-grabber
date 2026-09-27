@@ -26,10 +26,14 @@ A Chrome extension that detects videos playing in the current tab and lets you d
 The generated command looks like:
 
 ```
-ffmpeg -user_agent '...' -headers 'Referer: ...\r\nCookie: ...\r\n' -i 'STREAM_URL' -c copy -bsf:a aac_adtstoasc 'output.mp4'
+ffmpeg -user_agent '...' -headers $'Referer: ...\r\nCookie: ...\r\n' -i 'STREAM_URL' -c copy -bsf:a aac_adtstoasc 'output.mp4'
 ```
 
 Why the extra flags: many streams (Vimeo, CDN-hosted HLS) reject requests that don't carry the original `Referer`, `User-Agent`, or `Cookie`. The extension captures those from the real playback request and bakes them into the command, so ffmpeg isn't rejected with a 403. `-c copy` remuxes without re-encoding (fast, original quality); `-bsf:a aac_adtstoasc` fixes AAC audio when packing HLS into MP4.
+
+The `$'...'` quoting around the headers is deliberate: bash and zsh turn the `\r\n` into real line breaks, which ffmpeg needs between headers, while the command stays on one line so it pastes cleanly. Plain `'...'` would pass a literal backslash-r to ffmpeg.
+
+On Patreon, the popup skips the ffmpeg command for the Mux stream and points you to the Patreon `yt-dlp` command instead (see below) — Patreon's signed streams reject ffmpeg.
 
 **Note:** this still won't defeat DRM-encrypted streams (e.g. Widevine on Netflix). It works on plain HLS/DASH whose segments aren't encrypted with a key you don't have.
 
@@ -53,6 +57,44 @@ If a download fails with `403` / `private`, your login token expired — reload
 the page in Chrome, play the video once, then re-run the command (it re-reads
 fresh cookies each time).
 
+## Patreon posts (the automated workflow)
+
+Patreon serves video through **Mux** using a short-lived signed token plus a
+referrer restriction. That means the raw `.m3u8` **cannot** be replayed in a
+plain ffmpeg command — the CDN rejects it (`403 Forbidden`, or `400 Bad
+Request` once a referer is added). So the extension doesn't try. Instead, when
+it detects a Patreon post page that contains video, the popup shows a
+**Patreon post** section with a ready-to-paste `yt-dlp` command:
+
+```
+yt-dlp --cookies-from-browser chrome 'https://www.patreon.com/posts/<POST_ID>'
+```
+
+Why this works when the raw stream doesn't:
+
+- `yt-dlp`'s Patreon extractor takes the **post URL**, reads your logged-in
+  browser cookies, and asks Patreon for a correctly signed stream itself — so
+  there's no expired-token or missing-referer problem.
+- It always uses the canonical `patreon.com/posts/<id>` form. A creator-prefixed
+  URL like `patreon.com/<creator>/posts/<slug>-<id>` falls back to yt-dlp's
+  generic extractor and fails with `Unsupported URL`, so the extension rebuilds
+  the canonical URL from the numeric post id automatically.
+- With ffmpeg on PATH, yt-dlp merges audio + video into a single MP4.
+
+**Steps:**
+
+1. Install `yt-dlp` (`brew install yt-dlp`) and `ffmpeg` if you don't have them.
+2. Open the Patreon post so the video is on the page.
+3. Open the extension popup → **Patreon post** section → **Copy yt-dlp command**
+   (or **Copy (save to ~/Downloads)** for a clean filename in your Downloads
+   folder).
+4. Paste into Terminal and run.
+
+Not using Chrome? Swap `chrome` for `safari`, `firefox`, `brave`, or `edge` in
+the command. If yt-dlp can't read the cookie database, fully quit the browser
+and re-run. yt-dlp only downloads posts your logged-in account is actually
+entitled to watch.
+
 ## What it can and can't do
 
 **Works:** ordinary sites that serve a direct video file, and open (non-encrypted) HLS/DASH streams.
@@ -61,8 +103,8 @@ fresh cookies each time).
 
 ## How it works
 
-- `background.js` — a service worker that watches network responses for media content-types/extensions and tracks them per tab.
-- `content.js` — reports `<video>` element sources that start playing.
+- `background.js` — a service worker that watches network responses for media content-types/extensions and tracks them per tab. Chrome shuts the worker down after ~30 seconds idle, so the per-tab list (and the captured request headers) is kept in `chrome.storage.session`: it survives the worker restarting, is wiped when the browser closes, and isn't readable by web pages. A tab's list resets when it loads a new page or an in-page route change (e.g. moving between Patreon posts), but not on a `#fragment` change, since the same video is still playing.
+- `content.js` — reports `<video>` element sources that start playing, Vimeo embeds, and Patreon video posts.
 - `popup.html` / `popup.js` — lists what was found for the active tab and provides download / copy actions.
 
 ## Files
@@ -78,5 +120,6 @@ video-grabber/
 │   ├── icon16.png
 │   ├── icon48.png
 │   └── icon128.png
+├── grabvid-setup.md
 └── README.md
 ```

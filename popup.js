@@ -2,6 +2,7 @@
 
 const listEl = document.getElementById("list");
 const vimeoEl = document.getElementById("vimeo");
+const patreonEl = document.getElementById("patreon");
 const emptyEl = document.getElementById("empty");
 const countEl = document.getElementById("count");
 
@@ -80,6 +81,57 @@ function renderVimeo(vimeo) {
   });
 }
 
+function renderPatreon(patreon) {
+  patreonEl.innerHTML = "";
+  if (!patreon || patreon.length === 0) return;
+
+  const label = document.createElement("div");
+  label.className = "section-label";
+  label.textContent = "Patreon post — download via terminal";
+  patreonEl.appendChild(label);
+
+  patreon.forEach((p) => {
+    const item = document.createElement("div");
+    item.className = "vitem";
+
+    const id = document.createElement("div");
+    id.className = "vid";
+    id.textContent = "Patreon post " + p.id;
+    item.appendChild(id);
+
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.textContent =
+      "Patreon video (Mux/signed stream) — run this in Terminal. It reads your " +
+      "logged-in Chrome cookies and merges audio+video into one MP4 (needs " +
+      "yt-dlp + ffmpeg). Not on Chrome? Swap 'chrome' for safari/firefox/brave/edge.";
+    item.appendChild(hint);
+
+    const cmd = document.createElement("div");
+    cmd.className = "cmd";
+    cmd.textContent = p.ytdlp;
+    item.appendChild(cmd);
+
+    const actions = document.createElement("div");
+    actions.className = "cmd-actions";
+    actions.appendChild(copyButton("Copy yt-dlp command", () => p.ytdlp));
+    const alt = copyButton("Copy (save to ~/Downloads)", () => p.ytdlpNamed);
+    alt.className = "secondary";
+    actions.appendChild(alt);
+    item.appendChild(actions);
+
+    patreonEl.appendChild(item);
+  });
+}
+
+function isMux(url) {
+  try {
+    return /(^|\.)mux\.com$/i.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
 function getActiveTab() {
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -88,11 +140,15 @@ function getActiveTab() {
   });
 }
 
-function render(media, vimeo) {
+function render(media, vimeo, patreon) {
   listEl.innerHTML = "";
+  renderPatreon(patreon);
   renderVimeo(vimeo);
 
-  const total = (media ? media.length : 0) + (vimeo ? vimeo.length : 0);
+  const total =
+    (media ? media.length : 0) +
+    (vimeo ? vimeo.length : 0) +
+    (patreon ? patreon.length : 0);
   if (total === 0) {
     emptyEl.style.display = "block";
     countEl.textContent = "";
@@ -100,6 +156,7 @@ function render(media, vimeo) {
   }
   emptyEl.style.display = "none";
   countEl.textContent = total + " found";
+  const hasPatreon = !!(patreon && patreon.length);
 
   (media || []).forEach((m) => {
     const item = document.createElement("div");
@@ -143,7 +200,15 @@ function render(media, vimeo) {
 
     item.appendChild(row);
 
-    if (m.type !== "direct") {
+    if (m.type !== "direct" && hasPatreon && isMux(m.url)) {
+      // Patreon's Mux streams are signed + referrer-restricted; replaying them
+      // in ffmpeg fails with 403/400, so point at the yt-dlp command instead.
+      const hint = document.createElement("div");
+      hint.className = "hint";
+      hint.textContent =
+        "Patreon's signed Mux stream: ffmpeg gets rejected (403/400). Use the Patreon yt-dlp command above instead.";
+      item.appendChild(hint);
+    } else if (m.type !== "direct") {
       const hint = document.createElement("div");
       hint.className = "hint";
       hint.textContent =
@@ -175,7 +240,11 @@ function render(media, vimeo) {
 function load() {
   if (activeTabId == null) return;
   chrome.runtime.sendMessage({ type: "getMedia", tabId: activeTabId }, (resp) => {
-    render(resp ? resp.media : [], resp ? resp.vimeo : []);
+    render(
+      resp ? resp.media : [],
+      resp ? resp.vimeo : [],
+      resp ? resp.patreon : []
+    );
   });
 }
 
