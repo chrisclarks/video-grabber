@@ -21,7 +21,7 @@ const MAX_HEADERS_PER_TAB = 50;
 
 // Referer used for Vimeo commands when the page URL can't be parsed. Matches
 // the default baked into the grabvid helper (see grabvid-setup.md).
-const DEFAULT_REFERER = "https://www.warc.com/";
+const DEFAULT_REFERER = "https://player.vimeo.com/";
 
 const ready = chrome.storage.session
   .get(null)
