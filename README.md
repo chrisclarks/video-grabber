@@ -101,6 +101,13 @@ entitled to watch.
 
 **Won't work:** DRM-protected or privacy-locked players (Netflix, most paid streaming, and Vimeo embeds set to "no download" or token-encrypted). These deliberately encrypt their streams; this extension does not and will not bypass that. Only download content you have the right to download.
 
+## Privacy and permissions
+
+- **Developer-mode tool.** Load it unpacked (`chrome://extensions` → Developer mode → Load unpacked). It isn't built for the Chrome Web Store: it needs access to every site, and the store doesn't allow YouTube download tools.
+- **Permissions.** `<all_urls>` and `webRequest` let it see media requests on any page. `downloads`, `storage`, `tabs` and `webNavigation` handle saving files and tracking per-tab state. Nothing else.
+- **Cookies.** For HLS/DASH streams it records the Referer, Origin, User-Agent and Cookie headers of the manifest request, so the ffmpeg command it builds is accepted by the CDN. These stay in `chrome.storage.session`, which is wiped when the browser closes and isn't readable by web pages. Nothing is sent anywhere.
+- **But the copied command contains your session cookie.** Treat it like a password: don't paste it into chats, issues or shared docs. It also lands in your shell history; add `setopt HIST_IGNORE_SPACE` to `~/.zshrc` and start the command with a space to keep it out.
+
 ## How it works
 
 - `background.js` — a service worker that watches network responses for media content-types/extensions and tracks them per tab. Chrome shuts the worker down after ~30 seconds idle, so the per-tab list (and the captured request headers) is kept in `chrome.storage.session`: it survives the worker restarting, is wiped when the browser closes, and isn't readable by web pages. A tab's list resets when it loads a new page or an in-page route change (e.g. moving between Patreon posts), but not on a `#fragment` change, since the same video is still playing.
